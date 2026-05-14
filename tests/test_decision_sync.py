@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from decision_sync import (  # noqa: E402
     ChromeMCPUnavailable,
+    ConcurrentRunError,
     Decision,
     DecisionSyncConfig,
     DecisionSyncEngine,
@@ -40,6 +41,15 @@ def write_mock(path: Path, decisions: list[dict[str, str]]) -> None:
 
 def cfg(tmp_path: Path, env: dict[str, str] | None = None) -> DecisionSyncConfig:
     return DecisionSyncConfig.from_file(ROOT / "config.yaml", env=env or {}, project_root=tmp_path)
+
+
+@pytest.fixture
+def engine(tmp_path: Path) -> DecisionSyncEngine:
+    mock = tmp_path / "mock.json"
+    write_mock(mock, [sample_decision()])
+    c = cfg(tmp_path)
+    c.mock_localstorage_path = mock
+    return DecisionSyncEngine(c)
 
 
 def test_default_mock_mode_no_chrome_no_sf(tmp_path: Path) -> None:
@@ -166,6 +176,58 @@ def test_decision_stats_aggregation(tmp_path: Path) -> None:
     decisions = [sample_decision("a", "approve"), sample_decision("b", "reject"), sample_decision("c", "modify")]
     result = DecisionSyncEngine(c, localstorage_reader=StaticReader(decisions)).run(enforce_mutex=False)
     assert result["stats"]["by_decision_type"] == {"approve": 1, "modify": 1, "reject": 1}
+
+
+def test_pii_scrubbed_in_output_with_kemmer_name(engine: DecisionSyncEngine) -> None:
+    decision = sample_decision()
+    decision["reason"] = "Martin aligned with Imke on the creative decision."
+    write_mock(engine.config.mock_localstorage_path, [decision])
+    engine.run(enforce_mutex=False)
+    assert "Martin" not in engine.config.stats_path.read_text(encoding="utf-8")
+    assert "Imke" not in engine.config.stats_path.read_text(encoding="utf-8")
+    assert "Martin" not in engine.config.report_path.read_text(encoding="utf-8")
+    assert "Imke" not in engine.config.report_path.read_text(encoding="utf-8")
+
+
+def test_k13_pre_action_verification_env_tag_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DF_ENV_TAG", "prod")
+    c = cfg(
+        tmp_path,
+        {
+            "DF_HLM_5_REAL_SALESFORCE_ENABLED": "true",
+            "SF_ENV": "sandbox",
+            "PHRONESIS_TICKET": "PT-2026-05-001",
+        },
+    )
+    engine = DecisionSyncEngine(
+        c,
+        localstorage_reader=StaticReader([sample_decision()]),
+        salesforce_client=MockSalesforceClient(),
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.run(enforce_mutex=False)
+    assert "K13" in str(exc_info.value)
+
+
+def test_mock_provenance_explicit_in_output(engine: DecisionSyncEngine) -> None:
+    engine.run(enforce_mutex=False)
+    payload = json.loads(engine.config.stats_path.read_text(encoding="utf-8"))
+    assert payload["provenance"]["mode"] == "mock"
+    assert "MOCK-" in payload["provenance"]["reference_url"]
+
+
+def test_k16_mutex_blocks_concurrent_spawn(tmp_path: Path) -> None:
+    c = cfg(tmp_path)
+    c.lock_dir = tmp_path / "df-hlm-5.lock"
+    first = DecisionSyncEngine(c)
+    second = DecisionSyncEngine(c)
+    first.acquire_mutex()
+    try:
+        with pytest.raises(ConcurrentRunError) as exc_info:
+            second.acquire_mutex()
+        assert "K16-VETO" in str(exc_info.value)
+    finally:
+        first.release_mutex()
 
 
 class StaticReader:

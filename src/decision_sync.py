@@ -32,16 +32,23 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DARK_FACTORIES_ROOT = PROJECT_ROOT.parent
-COMMON_ROOT = DARK_FACTORIES_ROOT / "_df_common"
-if str(COMMON_ROOT) not in sys.path and COMMON_ROOT.exists():
-    sys.path.insert(0, str(COMMON_ROOT))
+if str(DARK_FACTORIES_ROOT) not in sys.path:
+    sys.path.insert(0, str(DARK_FACTORIES_ROOT))
 
-from atomic_lock import AtomicLock  # type: ignore[import-not-found]
-from canonical_event_hash import compute_canonical_hash  # type: ignore[import-not-found]
-from secret_vault import SecretVault, VaultError  # type: ignore[import-not-found]
+from _df_common.pii_scrubber import PIIScrubber, scrub_audit_payload
+from _df_common.welle_b2_patches import (
+    K13PreActionVerifier,
+    K16MutexGuard,
+    MOCK_PREFIX,
+    make_mock_url,
+    make_provenance_envelope,
+)
+from _df_common.canonical_event_hash import compute_canonical_hash
+from _df_common.secret_vault import SecretVault, VaultError
 
 UTC = timezone.utc
 DECISION_TYPES = {"approve", "reject", "modify"}
+PII_SCRUB_KEYS = {"reason", "error", "details", "notes", "objective"}
 
 
 class ConfigurationError(RuntimeError):
@@ -197,14 +204,14 @@ class DecisionSyncConfig:
 
 
 class JsonAuditLogger:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, pii_scrubber: PIIScrubber):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.renderer = structlog.processors.JSONRenderer(sort_keys=True)
+        self.pii_scrubber = pii_scrubber
 
     def info(self, event: str, **fields: Any) -> None:
-        payload = {"ts": utc_now().isoformat(), **fields}
-        rendered = self.renderer(None, event, payload)
+        payload = scrub_audit_payload({"event": event, "ts": utc_now().isoformat(), **fields})
+        rendered = json.dumps(payload, sort_keys=True, default=str)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(rendered + "\n")
 
@@ -296,7 +303,8 @@ class DecisionSyncEngine:
     ):
         self.config = config
         self.now_provider = now_provider
-        self.audit = JsonAuditLogger(config.audit_log_path)
+        self.pii_scrubber = PIIScrubber(enabled=True, kemmer_names_enabled=True)
+        self.audit = JsonAuditLogger(config.audit_log_path, pii_scrubber=self.pii_scrubber)
         self.localstorage_reader = localstorage_reader or (
             ChromeMCPLocalStorageReader() if config.real_chrome_enabled else MockLocalStorageReader(config.mock_localstorage_path)
         )
@@ -304,7 +312,7 @@ class DecisionSyncEngine:
             RealSalesforceClient(config) if config.real_salesforce_enabled else MockSalesforceClient()
         )
         self.salesforce_breaker = CircuitBreaker(config.timeout_s, config.open_threshold)
-        self.lock = AtomicLock(config.lock_dir / "decision-sync.lock", ttl_s=600.0)
+        self.lock: K16MutexGuard | None = None
 
     def health_check(self) -> dict[str, Any]:
         return {"healthy": True, "dependencies": list(self.config.health_check_dependencies)}
@@ -323,20 +331,22 @@ class DecisionSyncEngine:
         )
 
     def acquire_mutex(self) -> None:
-        if not self.lock.acquire():
-            raise ConcurrentRunError(f"K16 mutex active: {self.config.lock_dir}")
+        guard = K16MutexGuard(lock_dir=self.config.lock_dir, df_engine_marker="decision_sync.py")
+        result = guard.acquire()
+        if not result.acquired:
+            raise ConcurrentRunError(f"K16-VETO: {result.reason}")
+        self.lock = guard
 
     def release_mutex(self) -> None:
-        self.lock.release()
+        if self.lock is not None:
+            self.lock.release()
+            self.lock = None
 
     def run(self, *, enforce_mutex: bool = True) -> dict[str, Any]:
-        if enforce_mutex:
-            self.acquire_mutex()
-        try:
+        if not enforce_mutex:
             return self._run_unlocked()
-        finally:
-            if enforce_mutex:
-                self.release_mutex()
+        with K16MutexGuard(lock_dir=self.config.lock_dir, df_engine_marker="decision_sync.py"):
+            return self._run_unlocked()
 
     def _run_unlocked(self) -> dict[str, Any]:
         started = self.now_provider()
@@ -356,10 +366,17 @@ class DecisionSyncEngine:
                 self._persist_state(decision, result)
                 results.append(result)
             except Exception as exc:
+                if isinstance(exc, RuntimeError) and str(exc).startswith("K13-VETO"):
+                    raise
                 self._write_dlq(decision_id, raw, exc)
                 results.append({"decision_id": decision_id, "status": "failed", "error": str(exc)})
         summary = self._write_outputs(started, results)
-        self.audit.info("run_completed", synced=summary["stats"]["synced"], queued=summary["stats"]["queued"], failed=summary["stats"]["failed"])
+        self.audit.info(
+            "mock_run_complete" if self._is_mock_mode() else "run_complete",
+            synced=summary["stats"]["synced"],
+            queued=summary["stats"]["queued"],
+            failed=summary["stats"]["failed"],
+        )
         return summary
 
     def resolve_mode(self) -> str:
@@ -404,11 +421,27 @@ class DecisionSyncEngine:
             },
         }
 
+    def _verify_real_dispatch(self) -> None:
+        if not self.config.real_salesforce_enabled:
+            return
+        verifier = K13PreActionVerifier(
+            expected_env_tag="dev",
+            expected_mount_pattern="/Users/make",
+            blast_radius_class="state-only",
+        )
+        result = verifier.verify()
+        if not result.ok:
+            raise RuntimeError(f"K13-VETO: {result.failed_check}")
+
+    def _is_mock_mode(self) -> bool:
+        return self.resolve_mode() != "full"
+
     def _sync_or_queue(self, decision: Decision, payload: dict[str, Any]) -> dict[str, Any]:
         if self.salesforce_breaker.is_open:
             self._queue_decision(decision, payload, "circuit_open")
             return {"status": "queued", "mode": "standalone_local_queue", "anchor_id": payload["idempotency_key"]}
         try:
+            self._verify_real_dispatch()
             result = self.salesforce_client.sync_decision_item(payload)
             self.salesforce_breaker.record_success()
             return {"status": "synced", **result}
@@ -433,13 +466,13 @@ class DecisionSyncEngine:
         hashes = set(state.get("synced_hashes", []))
         hashes.add(self.idempotency_key(decision))
         state["synced_hashes"] = sorted(hashes)
-        atomic_write_json(self.config.state_path, state)
+        self._write_json_output(self.config.state_path, state)
 
     def _queue_decision(self, decision: Decision, payload: dict[str, Any], reason: str) -> None:
-        atomic_write_json(self.config.queue_dir / f"{self.idempotency_key(decision)}.json", {"reason": reason, "payload": payload})
+        self._write_json_output(self.config.queue_dir / f"{self.idempotency_key(decision)}.json", {"reason": reason, "payload": payload})
 
     def _write_dlq(self, decision_id: str, raw: Mapping[str, Any], exc: Exception) -> None:
-        atomic_write_json(self.config.dlq_dir / f"{decision_id}.json", {"decision_id": decision_id, "error": str(exc), "raw": dict(raw)})
+        self._write_json_output(self.config.dlq_dir / f"{decision_id}.json", {"decision_id": decision_id, "error": str(exc), "raw": dict(raw)})
 
     def _load_state(self) -> dict[str, Any]:
         if not self.config.state_path.exists():
@@ -447,11 +480,35 @@ class DecisionSyncEngine:
         return json.loads(self.config.state_path.read_text(encoding="utf-8"))
 
     def _write_outputs(self, started: datetime, results: list[dict[str, Any]]) -> dict[str, Any]:
+        completed = self.now_provider()
         stats = aggregate_stats(results)
-        payload = {"run_started": started.isoformat(), "run_completed": self.now_provider().isoformat(), "stats": stats, "results": results}
-        atomic_write_json(self.config.stats_path, payload)
-        atomic_write_text(self.config.report_path, render_report(payload))
+        provenance = make_provenance_envelope(
+            df_id="DF-HLM-5",
+            timestamp_iso=completed.isoformat(),
+            is_mock=self._is_mock_mode(),
+            activation_gate_id=None if self._is_mock_mode() else self.config.phronesis_ticket,
+        )
+        if self._is_mock_mode():
+            provenance["reference_url"] = make_mock_url("https://df.local/decision-sync", completed.strftime("%Y%m%dT%H%M%SZ"))
+            provenance["reference_prefix"] = MOCK_PREFIX
+        payload = {
+            "run_started": started.isoformat(),
+            "run_completed": completed.isoformat(),
+            "mode": "mock" if self._is_mock_mode() else "real-api",
+            "provenance": provenance,
+            "stats": stats,
+            "results": results,
+        }
+        self._write_json_output(self.config.stats_path, payload)
+        self._write_text_output(self.config.report_path, render_report(payload))
         return payload
+
+    def _write_json_output(self, path: Path, payload: Mapping[str, Any]) -> None:
+        scrubbed_payload = scrub_output_payload(self.pii_scrubber, dict(payload))
+        atomic_write_json(path, scrubbed_payload)
+
+    def _write_text_output(self, path: Path, content: str) -> None:
+        atomic_write_text(path, self.pii_scrubber.scrub(content))
 
 
 def aggregate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -468,18 +525,27 @@ def aggregate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def render_report(payload: Mapping[str, Any]) -> str:
     stats = payload["stats"]
+    output_provenance = payload.get("provenance") or {}
     lines = [
         "# DF-HLM-5 Daily Decision Sync Report",
         "",
         f"- Run started: {payload['run_started']}",
         f"- Run completed: {payload['run_completed']}",
+        f"- Output mode: {payload.get('mode', 'unknown')}",
         f"- Total decisions: {stats['total']}",
         f"- Synced: {stats['synced']}",
         f"- Queued: {stats['queued']}",
         f"- Failed: {stats['failed']}",
         "",
+        "## Output Provenance",
+        f"- DF ID: {output_provenance.get('df_id', 'DF-HLM-5')}",
+        f"- Mode: {output_provenance.get('mode', payload.get('mode', 'unknown'))}",
+        f"- Timestamp: {output_provenance.get('timestamp_iso', payload['run_completed'])}",
+        "",
         "## Provenance",
     ]
+    if output_provenance.get("reference_url"):
+        lines.append(f"- Mock reference: {output_provenance['reference_url']}")
     for result in payload["results"]:
         decision = result.get("decision") or {}
         sync = result.get("sync") or {}
@@ -490,6 +556,23 @@ def render_report(payload: Mapping[str, Any]) -> str:
                 f"browser_session_id={decision['browser_session_id']} status={result['status']}"
             )
     return "\n".join(lines) + "\n"
+
+
+def scrub_output_payload(scrubber: PIIScrubber, payload: Mapping[str, Any]) -> dict[str, Any]:
+    scrubbed: dict[str, Any] = {}
+    for key, value in payload.items():
+        scrubbed[key] = scrub_output_value(scrubber, key, value)
+    return scrubbed
+
+
+def scrub_output_value(scrubber: PIIScrubber, key: str, value: Any) -> Any:
+    if isinstance(value, dict):
+        return scrub_output_payload(scrubber, value)
+    if isinstance(value, list):
+        return [scrub_output_value(scrubber, key, item) for item in value]
+    if isinstance(value, str) and key in PII_SCRUB_KEYS:
+        return scrubber.scrub(value)
+    return value
 
 
 def utc_now() -> datetime:
