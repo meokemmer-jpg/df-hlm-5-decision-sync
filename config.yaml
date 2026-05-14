@@ -1,0 +1,122 @@
+name: df-hlm-5-decision-sync
+version: 1
+domain: HeyLou-Marketing-Wave-2
+description: "Chrome-MCP-LocalStorage to Salesforce Marketing Cloud decision sync."
+
+execution:
+  phase_1_mock_localstorage_path: /tmp/df-hlm-5-mock-localstorage.json
+  phase_3_localstorage_key: imke-decisions
+  salesforce_custom_object: Marketing-Decision-Item
+  output_report_markdown: output/daily-sync-report.md
+  output_stats_json: output/decision-stats.json
+  audit_log: output/audit.log
+  queue_dir: output/local-queue
+  dlq_dir: output/dlq
+  state_json: output/state.json
+
+constraints:
+  k11:
+    cascade_containment: true
+    failure_blast_radius: 1
+    dependency_dlq_separate: true
+    dlq_scope: per_decision_id
+  k12:
+    distillation_resistenz: true
+    provenance_required_in_output: true
+    provenance_fields:
+      - decision_hash
+      - imke_timestamp
+      - browser_session_id
+    non_llm_validation_layer: true
+  k13:
+    independent_ground_truth: true
+    external_anchor_type:
+      - browser_localstorage
+      - salesforce_api
+    pre_action_domain_check: true
+  k14:
+    human_override_decay: true
+    override_complexity: single_command
+    martin_review_cadence: weekly
+    stop_flag: STOP.flag
+  k15:
+    entropy_budget: true
+    entropy_added_loc_estimate: 350
+    entropy_justified_by_rho: "EUR 55-70k/Jahr Decision-Traceability + Salesforce-Sync"
+  k16:
+    concurrent_spawn_mutex: true
+    lock_dir: /tmp/df-hlm-5.lock
+    lock_file: decision-sync.lock
+    engine_pgrep_check: true
+
+lose_coupling:
+  lc1:
+    graceful_degradation: true
+    modes:
+      - full
+      - degraded_chrome_mcp
+      - degraded_salesforce_api
+      - standalone_local_queue
+  lc2:
+    direct_mode_fallback: true
+    capability: 0.50
+    trigger: "Chrome-MCP unreachable OR Salesforce-API down >30s"
+  lc3:
+    circuit_breaker: true
+    timeout_s: 30
+    open_threshold: 3
+  lc4:
+    failure_isolation: true
+    state_externalization: true
+    idempotent: true
+    idempotency_key_basis:
+      - decision_id
+      - browser_session_id
+      - imke_timestamp
+  lc5:
+    health_check_independence: true
+    health_check_dependencies: []
+
+env_gating:
+  real_chrome_mcp:
+    env_var: DF_HLM_5_REAL_CHROME_MCP_ENABLED
+    default: "false"
+    required_for_live_localstorage_read: true
+  real_salesforce:
+    env_var: DF_HLM_5_REAL_SALESFORCE_ENABLED
+    default: "false"
+    required_for_live_sync: true
+  sf_env:
+    env_var: SF_ENV
+    allowed:
+      - sandbox
+      - production
+    required_for_live_sync: true
+    production_explicit: true
+  phronesis_ticket:
+    env_var: PHRONESIS_TICKET
+    required_pattern: "PT-2026-"
+    required_for_live_sync: true
+
+salesforce:
+  custom_object: Marketing-Decision-Item
+  oauth_secret_name: salesforce_oauth_access_token
+  base_url_env: SF_API_BASE_URL
+  token_env: DF_HLM_5_SF_OAUTH_TOKEN
+  secret_vault_path_env: DF_HLM_5_SECRET_VAULT_PATH
+  secret_vault_master_key_path_env: DF_HLM_5_SECRET_VAULT_MASTER_KEY_PATH
+
+localstorage_schema:
+  required:
+    - decision_id
+    - asset_id
+    - hotel_id
+    - persona_id
+    - decision_type
+    - reason
+    - imke_timestamp
+    - browser_session_id
+  decision_types:
+    - approve
+    - reject
+    - modify
