@@ -1,0 +1,10 @@
+{
+  "df_name": "df-hlm-5-decision-sync",
+  "parent": "backfill-root",
+  "generation": 0,
+  "born_at": "2026-05-18T11:10:45.061418+00:00",
+  "mutation_path": [],
+  "status": "alive",
+  "deaths": [],
+  "revivals": []
+}
