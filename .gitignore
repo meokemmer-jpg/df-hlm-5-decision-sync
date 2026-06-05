@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.log
+*.env
+.env
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+secrets.json
+credentials.json
