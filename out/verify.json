@@ -1,0 +1,12 @@
+{
+  "df": "df-hlm-5-decision-sync",
+  "ts": "2026-06-08T19:55:09.406052+00:00",
+  "has_src": true,
+  "parse_ok": true,
+  "has_tests": true,
+  "test_ran": true,
+  "tests_passed": true,
+  "code_hash": "619148d75e37a701",
+  "python": "3.14.4",
+  "crux": "[CRUX-MK]"
+}
