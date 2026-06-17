@@ -120,3 +120,4 @@ localstorage_schema:
     - approve
     - reject
     - modify
+crux-mk: true
