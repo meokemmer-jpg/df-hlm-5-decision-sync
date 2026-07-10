@@ -1,9 +1,9 @@
 {
   "df": "df-hlm-5-decision-sync",
-  "ts": "2026-07-10T01:05:11.233011+00:00",
+  "ts": "2026-07-10T02:58:06.768614+00:00",
   "maturity": "TESTED",
   "maturity_level": 4,
   "evidence_grade": 4,
-  "wargame_verdict": null,
+  "wargame_verdict": "CONDITIONAL",
   "crux": "[CRUX-MK]"
 }
